@@ -115,4 +115,4 @@ Afedium/
 ---
 
 ## License
-本项目采用 [GPL-3.0 License](LICENSE) 开源许可。
+本项目采用 [AGPL-3.0 License](LICENSE) 开源许可。
