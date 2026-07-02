@@ -275,7 +275,7 @@ pip_mirror = ''
 config_file = 'config/main.json'
 default = {
     "hostname": platform.node(),
-    "Disabled": ["module_template"],
+    "disabled": ["module_template"],
     "online": True,
     "allow_global_install": False,
     "pip_mirror": "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple",
@@ -318,36 +318,88 @@ def main():
 
         log.info(f"系统: {static['SYS_INFO']}")
         log.info(f"Python: {static['PY_VER']}")
-        log.info(f"已禁用模块: {config.conf.get('Disabled', [])}")
+        log.info(f"已禁用模块: {config.conf.get('disabled', [])}")
 
-        from lib.support_lib import get_info_from_pyz, check_git, load_pyz_module, load_static
+        from lib.support_lib import (
+            check_git,
+            get_configured_disabled_modules,
+            get_disabled_modules,
+            get_info_from_py,
+            get_info_from_pyz,
+            is_module_disabled,
+            load_module_specs_by_dependencies,
+            load_pyz_module,
+            load_static,
+            resolve_effective_disabled_modules,
+        )
+
+        disabled_modules = get_configured_disabled_modules(config.conf)
+        static["configured_disabled_modules"] = sorted(disabled_modules)
+        static["disabled_modules"] = sorted(disabled_modules)
 
         # 1. 加载系统模块
         static["system_path"] = "system"
         sys.path.append(static["system_path"])
         if os.path.exists(static["system_path"]):
-            system_files = [f.split('.')[0] for f in os.listdir(static["system_path"]) if f.endswith(".py")]
+            system_specs = []
+            system_files = sorted(f.split('.')[0] for f in os.listdir(static["system_path"]) if f.endswith(".py"))
             for name in system_files:
-                if name not in config.conf.get('Disabled', []):
-                    log.info(f"正在加载系统模块: {name}")
-                    load_static(static["system_path"], name)
+                module_path = os.path.join(static["system_path"], f"{name}.py")
+                info = get_info_from_py(module_path)
+                if not info:
+                    log.warning(f"无法从 {module_path} 读取系统模块信息，已跳过。")
+                    continue
+                module_id = info.get("id", name)
+                if is_module_disabled(module_id, disabled_modules, aliases=[name]):
+                    log.info(f"系统模块 {module_id} 已禁用，跳过。")
+                    continue
+                system_specs.append({"id": module_id, "name": name, "info": info})
+
+            system_disabled, system_disabled_reasons = resolve_effective_disabled_modules(system_specs, disabled_modules)
+            for module_id, disabled_deps in system_disabled_reasons.items():
+                log.warning(f"系统模块 {module_id} 的前置依赖已禁用，自动禁用该模块: {disabled_deps}")
+            static["disabled_modules"] = sorted(system_disabled)
+            system_specs = [spec for spec in system_specs if spec["id"] not in system_disabled]
+
+            def load_system_spec(spec):
+                log.info(f"正在加载系统模块: {spec['name']}")
+                return load_static(static["system_path"], spec["name"])
+
+            load_module_specs_by_dependencies(system_specs, load_system_spec, "系统")
 
         # 2. 加载 PYZ 动态模块
         static["pyz_module_path"] = "pyz_modules"
         sys.path.append(static["pyz_module_path"])
         if os.path.exists(static["pyz_module_path"]):
-            pyz_files = [f for f in os.listdir(static["pyz_module_path"]) if f.endswith(".pyz")]
+            pyz_specs = []
+            pyz_files = sorted(f for f in os.listdir(static["pyz_module_path"]) if f.endswith(".pyz"))
             for file_name in pyz_files:
                 module_path = os.path.join(static["pyz_module_path"], file_name)
                 info = get_info_from_pyz(module_path)
                 if info:
                     module_id = info.get("id")
+                    if not module_id:
+                        log.warning(f"{file_name} 缺少模块ID，已跳过。")
+                        continue
                     static["modules"][module_id] = info.get("version")
-                    if module_id not in config.conf.get('Disabled', []):
-                        log.info(f"正在加载 PYZ 模块: {file_name}")
-                        load_pyz_module(module_path)
+                    if is_module_disabled(module_id, disabled_modules, aliases=[os.path.splitext(file_name)[0]]):
+                        log.info(f"PYZ 模块 {module_id} 已禁用，跳过。")
+                        continue
+                    pyz_specs.append({"id": module_id, "name": file_name, "path": module_path, "info": info})
                 else:
                     log.warning(f"无法从 {file_name} 读取信息，已跳过。")
+
+            pyz_disabled, pyz_disabled_reasons = resolve_effective_disabled_modules(pyz_specs, set(static["disabled_modules"]))
+            for module_id, disabled_deps in pyz_disabled_reasons.items():
+                log.warning(f"PYZ 模块 {module_id} 的前置依赖已禁用，自动禁用该模块: {disabled_deps}")
+            static["disabled_modules"] = sorted(pyz_disabled)
+            pyz_specs = [spec for spec in pyz_specs if spec["id"] not in pyz_disabled]
+
+            def load_pyz_spec(spec):
+                log.info(f"正在加载 PYZ 模块: {spec['name']}")
+                return load_pyz_module(spec["path"])
+
+            load_module_specs_by_dependencies(pyz_specs, load_pyz_spec, "PYZ")
 
         static["running"]["core"] = True
 

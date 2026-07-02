@@ -11,6 +11,13 @@ from lib.common import static, loaded_plugins, threads, plugin_lock, comm_lib
 from lib.config import Config
 from lib.logger import log
 from lib.plugin import AfediumPluginBase
+from lib.support_lib import (
+    get_configured_disabled_modules,
+    get_disabled_modules,
+    get_missing_dependencies,
+    is_module_disabled,
+    resolve_effective_disabled_modules,
+)
 
 Info = {
     "name": "开发者工具",
@@ -41,8 +48,10 @@ class AFEDIUMPlugin(AfediumPluginBase):
         self.hot_reload = self.config.conf.get("hot_reload", True)
         self.reload_interval = self.config.conf.get("reload_interval", 2.0)
 
-        # 记录已追踪的源码目录，格式: { mod_path: {'mtime': float, 'plugin_id': str} }
+        # 记录已追踪的源码目录，格式:
+        # { mod_path: {'mtime': float, 'plugin_id': str|None, 'state': str, 'disable_reason': tuple[str, ...]|None} }
         self.tracked_dirs = {}
+        self.pending_reload_paths = set()
 
         if not self.enabled:
             return True
@@ -101,29 +110,131 @@ class AFEDIUMPlugin(AfediumPluginBase):
         """扫描目录并对比修改时间"""
         if not os.path.exists(self.source_dir): return
 
-        current_dirs = [os.path.join(self.source_dir, d) for d in os.listdir(self.source_dir) if
-                        os.path.isdir(os.path.join(self.source_dir, d))]
+        current_dirs = sorted(os.path.join(self.source_dir, d) for d in os.listdir(self.source_dir) if
+                              os.path.isdir(os.path.join(self.source_dir, d)))
+        discovered_specs = []
 
         for mod_path in current_dirs:
             current_mtime = self.get_dir_mtime(mod_path)
             tracked = self.tracked_dirs.get(mod_path)
+            info = self._read_dev_module_info(mod_path)
+            if not info:
+                self.tracked_dirs[mod_path] = {
+                    'mtime': current_mtime,
+                    'plugin_id': None,
+                    'state': 'invalid',
+                    'disable_reason': None,
+                }
+                continue
 
-            # 1. 发现新放入的源码目录
+            plugin_id = info.get("id")
+            discovered_specs.append({
+                "id": plugin_id,
+                "path": mod_path,
+                "info": info,
+                "mtime": current_mtime,
+                "tracked": tracked,
+            })
+
+        if not discovered_specs:
+            return
+
+        effective_disabled, propagated_reasons = resolve_effective_disabled_modules(
+            discovered_specs,
+            get_configured_disabled_modules(),
+        )
+        static["disabled_modules"] = sorted(effective_disabled)
+
+        load_candidates = []
+        for spec in discovered_specs:
+            mod_path = spec["path"]
+            plugin_id = spec["id"]
+            tracked = spec.get("tracked")
+
+            if plugin_id in effective_disabled:
+                disable_reason = tuple(sorted(propagated_reasons.get(plugin_id, ("configured_disabled",))))
+                already_disabled = (
+                    tracked
+                    and tracked.get("state") == "disabled"
+                    and tracked.get("disable_reason") == disable_reason
+                )
+                if tracked and tracked.get('plugin_id'):
+                    self.unload_dev_module(tracked['plugin_id'])
+                self.pending_reload_paths.discard(mod_path)
+                self.tracked_dirs[mod_path] = {
+                    'mtime': spec["mtime"],
+                    'plugin_id': None,
+                    'state': 'disabled',
+                    'disable_reason': disable_reason,
+                }
+                if not already_disabled:
+                    if plugin_id in propagated_reasons:
+                        log.warning(f"[{self.id}] 开发模块 {plugin_id} 的前置依赖已禁用，自动禁用该模块: {list(disable_reason)}")
+                    else:
+                        log.info(f"[{self.id}] 开发模块 {plugin_id or os.path.basename(mod_path)} 已禁用，跳过。")
+                continue
+
+            action = None
             if not tracked:
-                log.info(f"[{self.id}] 检测到新模块源码，正在挂载: {os.path.basename(mod_path)}")
-                self.load_dev_module(mod_path)
+                action = "new"
+            elif tracked.get("state") == "disabled":
+                action = "reenabled"
+            elif spec["mtime"] > tracked.get('mtime', 0) or mod_path in self.pending_reload_paths:
+                action = "reload"
 
-            # 2. 发现代码被修改 (Ctrl+S 保存)
-            elif current_mtime > tracked['mtime']:
+            if not action:
+                continue
+
+            if action == "reload":
                 log.info(f"[{self.id}] 检测到代码更改，正在重载: {os.path.basename(mod_path)}")
-                # 如果之前加载成功了，先把它安全卸载掉
                 if tracked['plugin_id']:
                     self.unload_dev_module(tracked['plugin_id'])
                     time.sleep(0.3)  # 给线程一点释放端口和锁的时间
-                # 重新挂载新代码
-                self.load_dev_module(mod_path)
+            elif action == "new":
+                log.info(f"[{self.id}] 检测到新模块源码，正在挂载: {os.path.basename(mod_path)}")
+            elif action == "reenabled":
+                log.info(f"[{self.id}] 开发模块 {plugin_id} 已解除禁用，准备重新挂载。")
 
-    def load_dev_module(self, mod_path):
+            load_candidates.append({
+                "id": plugin_id,
+                "path": mod_path,
+                "info": spec["info"],
+                "mtime": spec["mtime"],
+                "action": action,
+            })
+
+        self._load_dev_candidates(load_candidates)
+
+    def _load_dev_candidates(self, candidates):
+        pending = list(candidates)
+        still_pending = set()
+
+        while pending:
+            progressed = False
+            for spec in pending.copy():
+                missing = get_missing_dependencies(spec["info"])
+                if missing:
+                    continue
+
+                if self.load_dev_module(spec["path"], info=spec["info"], mtime=spec["mtime"]):
+                    progressed = True
+                    pending.remove(spec)
+                    self.pending_reload_paths.discard(spec["path"])
+                else:
+                    progressed = True
+                    pending.remove(spec)
+
+            if not progressed:
+                for spec in pending:
+                    missing = get_missing_dependencies(spec["info"])
+                    self.tracked_dirs[spec["path"]] = {'mtime': spec["mtime"], 'plugin_id': None}
+                    still_pending.add(spec["path"])
+                    log.warning(f"[{self.id}] 开发模块 {spec['id']} 缺少前置依赖，暂缓挂载: {missing}")
+                break
+
+        self.pending_reload_paths = still_pending
+
+    def load_dev_module(self, mod_path, info=None, mtime=None):
         """直接从源码文件夹热加载模块到系统中"""
         folder_name = os.path.basename(mod_path)
         info_path = os.path.join(mod_path, "info.json")
@@ -131,16 +242,29 @@ class AFEDIUMPlugin(AfediumPluginBase):
 
         # 无论成功失败，都先更新文件的最后修改时间戳
         # 这样即使你写了语法错误导致崩溃，系统也不会无限重载，而是安静等待你下一次保存修复
-        self.tracked_dirs[mod_path] = {'mtime': self.get_dir_mtime(mod_path), 'plugin_id': None}
+        self.tracked_dirs[mod_path] = {'mtime': mtime if mtime is not None else self.get_dir_mtime(mod_path), 'plugin_id': None}
 
         if not os.path.exists(info_path) or not os.path.exists(main_path):
             log.warning(f"[{self.id}] 源码缺少 info.json 或 main.py，跳过: {folder_name}")
             return False
 
         try:
-            with open(info_path, 'r', encoding='utf-8') as f:
-                info = json.load(f)
+            if info is None:
+                with open(info_path, 'r', encoding='utf-8') as f:
+                    info = json.load(f)
             plugin_id = info.get("id")
+            if self._is_dev_module_disabled(plugin_id, mod_path):
+                log.info(f"[{self.id}] 开发模块 {plugin_id or folder_name} 已禁用，跳过。")
+                self.tracked_dirs[mod_path].update({'state': 'disabled', 'disable_reason': ('runtime_disabled',)})
+                self.pending_reload_paths.discard(mod_path)
+                return False
+
+            missing_dependencies = get_missing_dependencies(info)
+            if missing_dependencies:
+                log.warning(f"[{self.id}] 开发模块 {plugin_id} 缺少前置依赖，暂不挂载: {missing_dependencies}")
+                self.pending_reload_paths.add(mod_path)
+                self.tracked_dirs[mod_path].update({'state': 'waiting_dependencies', 'disable_reason': None})
+                return False
 
             # 关键：将开发目录临时加入系统路径，允许其内部 import 相对文件
             if mod_path not in sys.path:
@@ -183,14 +307,38 @@ class AFEDIUMPlugin(AfediumPluginBase):
             module_thread.start()
 
             # 更新追踪器状态，标记成功挂载的 ID
-            self.tracked_dirs[mod_path]['plugin_id'] = plugin_id
+            self.tracked_dirs[mod_path].update({
+                'plugin_id': plugin_id,
+                'state': 'active',
+                'disable_reason': None,
+            })
             log.info(f"[{self.id}] 开发挂载成功: {plugin_id}")
             return True
 
         except Exception as e:
             log.error(f"[{self.id}] 挂载源码 {folder_name} 时发生异常 (请修复代码后保存重试):\n{e}")
             log.debug(traceback.format_exc())
+            self.tracked_dirs[mod_path].update({'state': 'failed', 'disable_reason': None})
             return False
+
+    def _read_dev_module_info(self, mod_path):
+        folder_name = os.path.basename(mod_path)
+        info_path = os.path.join(mod_path, "info.json")
+        main_path = os.path.join(mod_path, "main.py")
+        if not os.path.exists(info_path) or not os.path.exists(main_path):
+            log.warning(f"[{self.id}] 源码缺少 info.json 或 main.py，跳过: {folder_name}")
+            return None
+        try:
+            with open(info_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            log.error(f"[{self.id}] 读取源码元数据失败 {folder_name}: {e}")
+            return None
+
+    def _is_dev_module_disabled(self, plugin_id, mod_path):
+        disabled_modules = get_disabled_modules()
+        return is_module_disabled(plugin_id or os.path.basename(mod_path), disabled_modules,
+                                  aliases=[os.path.basename(mod_path)])
 
     def unload_dev_module(self, plugin_id):
         """利用新架构的安全退出机制，拔掉开发模块"""

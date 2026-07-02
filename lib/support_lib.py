@@ -20,6 +20,109 @@ config = Config("core")
 anti_hack = re.compile(r"[\.\w-]+ *(?:[~<>=]{2})? *[\.\w]*")
 
 
+def get_configured_disabled_modules(config_conf=None):
+    if config_conf is None:
+        if "configured_disabled_modules" in static:
+            return {str(module_id) for module_id in static.get("configured_disabled_modules", [])}
+        config_conf = config.conf
+    return {str(module_id) for module_id in config_conf.get("disabled", [])}
+
+
+def get_disabled_modules(config_conf=None):
+    if config_conf is not None:
+        return get_configured_disabled_modules(config_conf)
+    if "disabled_modules" in static:
+        return {str(module_id) for module_id in static.get("disabled_modules", [])}
+    return get_configured_disabled_modules()
+
+
+def is_module_disabled(module_id, disabled_modules=None, aliases=None):
+    if disabled_modules is None:
+        disabled_modules = get_disabled_modules()
+    candidates = {str(module_id)}
+    if aliases:
+        candidates.update(str(alias) for alias in aliases)
+    return bool(candidates & disabled_modules)
+
+
+def get_available_module_ids():
+    module_ids = {"core"}
+    module_ids.update(loaded_plugins.keys())
+    return module_ids
+
+
+def get_missing_dependencies(info, available_ids=None):
+    if available_ids is None:
+        available_ids = get_available_module_ids()
+    dependencies = info.get("dependencies", []) if info else []
+    return [dep for dep in dependencies if dep not in available_ids]
+
+
+def get_module_spec_id(spec):
+    return spec.get("id") or spec.get("info", {}).get("id") or spec.get("name") or spec.get("path")
+
+
+def resolve_effective_disabled_modules(module_specs, disabled_ids=None):
+    effective_disabled = set(disabled_ids or [])
+    propagated_reasons = {}
+    pending = list(module_specs)
+
+    while pending:
+        progressed = False
+        for spec in pending.copy():
+            module_id = get_module_spec_id(spec)
+            if module_id in effective_disabled:
+                pending.remove(spec)
+                continue
+
+            disabled_deps = [dep for dep in spec.get("info", {}).get("dependencies", []) if dep in effective_disabled]
+            if not disabled_deps:
+                continue
+
+            effective_disabled.add(module_id)
+            propagated_reasons[module_id] = disabled_deps
+            pending.remove(spec)
+            progressed = True
+
+        if not progressed:
+            break
+
+    return effective_disabled, propagated_reasons
+
+
+def load_module_specs_by_dependencies(module_specs, loader, module_kind, available_ids=None):
+    available = set(available_ids or get_available_module_ids())
+    pending = list(module_specs)
+    loaded = []
+    blocked = []
+
+    while pending:
+        progressed = False
+        for spec in pending.copy():
+            module_id = get_module_spec_id(spec)
+            missing = get_missing_dependencies(spec.get("info", {}), available)
+            if missing:
+                continue
+
+            result = loader(spec)
+            pending.remove(spec)
+            progressed = True
+
+            if result is not None and result is not False:
+                available.add(module_id)
+                loaded.append(module_id)
+
+        if not progressed:
+            for spec in pending:
+                module_id = get_module_spec_id(spec)
+                missing = get_missing_dependencies(spec.get("info", {}), available)
+                blocked.append((spec, missing))
+                log.error(f"{module_kind}模块 {module_id} 缺少前置依赖，已跳过: {missing}")
+            break
+
+    return loaded, blocked
+
+
 class CustomJsonEncoder(json.JSONEncoder):
     def default(self, obj):
         try:
@@ -42,6 +145,24 @@ def get_info_from_pyz(pyz_path: str):
     return None
 
 
+def get_info_from_py(module_file_path):
+    try:
+        with open(module_file_path, "r", encoding="utf-8") as f:
+            code = f.read()
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+                if isinstance(target, ast.Name) and target.id == 'Info':
+                    try:
+                        return ast.literal_eval(node.value)
+                    except ValueError:
+                        continue
+    except (IOError, SyntaxError):
+        pass
+    return None
+
+
 def load_pyz_module(pyz_path, ttl=2):
     if ttl <= 0:
         return None
@@ -57,6 +178,11 @@ def load_pyz_module(pyz_path, ttl=2):
     plugin_id = info.get("id")
     if not plugin_id:
         log.error(f"{os.path.basename(pyz_path)} 的 info.json 中缺少 'id' 字段。")
+        return None
+
+    missing_dependencies = get_missing_dependencies(info)
+    if missing_dependencies:
+        log.error(f"插件 {plugin_id} 缺少前置依赖，暂不启动: {missing_dependencies}")
         return None
 
     try:
@@ -335,23 +461,6 @@ def check_git():
 
 
 def load_static(static_path, f_name, ttl: int = 1):
-    def get_info_from_py(module_file_path):
-        try:
-            with open(module_file_path, "r", encoding="utf-8") as f:
-                code = f.read()
-            tree = ast.parse(code)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                    target = node.targets[0]
-                    if isinstance(target, ast.Name) and target.id == 'Info':
-                        try:
-                            return ast.literal_eval(node.value)
-                        except ValueError:
-                            continue
-        except (IOError, SyntaxError):
-            pass
-        return None
-
     try:
         module = importlib.import_module(f"{os.path.basename(static_path)}.{f_name}")
         info = getattr(module, 'Info', None)
@@ -360,6 +469,11 @@ def load_static(static_path, f_name, ttl: int = 1):
             return None
 
         plugin_id = info["id"]
+        missing_dependencies = get_missing_dependencies(info)
+        if missing_dependencies:
+            log.error(f"系统模块 {plugin_id} 缺少前置依赖，暂不启动: {missing_dependencies}")
+            return None
+
         PluginClass = getattr(module, 'AFEDIUMPlugin', None)
 
         if not PluginClass:

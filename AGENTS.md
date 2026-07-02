@@ -48,7 +48,7 @@ Server on port `11840` (TCP, WebSocket) and `12840` (UDP broadcast for service d
 ## Config quirks
 
 - `config/core.json` → `debugging: true` enables `DEBUG`-level console output + a separate debug log file
-- `config/core.json` → `Disabled` list deactivates specific modules (use module ID, not filename)
+- `config/core.json` → `disabled` list deactivates specific modules (use module ID, not filename)
 - `config/ws_server.json` → `auth_type` supports `"none"`, `"password"`, or `"captcha"`
 
 ## No testing/linting infra
