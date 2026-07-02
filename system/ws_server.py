@@ -11,6 +11,9 @@ from lib.common import static
 from lib.config import Config
 from lib.logger import log
 from lib.plugin import AfediumPluginBase
+from lib.system_ui import SystemPopup
+
+AUTH_CONTROL_CODE = 0xFF
 
 Info = {
     "name": "WS服务器",
@@ -41,12 +44,11 @@ class AFEDIUMPlugin(AfediumPluginBase):
     }
 
     def setup(self):
-        # 兼容自动获取主机名的默认配置
+        # 如果仍使用默认服务名，就用主机名作为展示名称。
         if self.config.conf.get("server_name") == "afedium":
             self.config.conf["server_name"] = static.get("hostname", "afedium")
             self.config.update()
 
-        self.verification_codes = {}
         self.connected_clients = set()
         self.loop = None
 
@@ -77,45 +79,14 @@ class AFEDIUMPlugin(AfediumPluginBase):
     async def _websocket_handler(self, websocket):
         self.connected_clients.add(websocket)
         try:
-            auth_type = self.config.conf["auth_type"].lower()
-            if auth_type == "captcha":
-                verification_code = ''.join(
-                    secrets.choice('0123456789') for _ in range(self.config.conf["captcha_length"]))
-                self.verification_codes[websocket] = verification_code
-                log.info(f"新客户端连接，验证码：{verification_code}")
-
-                await websocket.send(chr(0x90) + "请输入验证码")
-                client_response = await asyncio.wait_for(websocket.recv(), timeout=self.config.conf["auth_timeout"])
-
-                if isinstance(client_response, str) and client_response[0] == chr(0x90) and client_response[
-                    1:] == verification_code:
-                    del self.verification_codes[websocket]
-                    await websocket.send(chr(0x91))
-                    log.debug(f"客户端 {websocket.remote_address} 认证成功")
-                else:
-                    await websocket.send(chr(0x92))
-                    log.warning(f"客户端 {websocket.remote_address} 认证失败")
-                    return
-
-            elif auth_type == "password":
-                await websocket.send(chr(0x90) + "请输入密码")
-                client_response = await asyncio.wait_for(websocket.recv(), timeout=self.config.conf["auth_timeout"])
-
-                if isinstance(client_response, str) and client_response[0] == chr(0x90) and client_response[1:] == \
-                        self.config.conf["password"]:
-                    await websocket.send(chr(0x91))
-                    log.debug(f"客户端 {websocket.remote_address} 认证成功")
-                else:
-                    await websocket.send(chr(0x92))
-                    log.warning(f"客户端 {websocket.remote_address} 认证失败")
-                    return
+            if not await self._authenticate_client(websocket):
+                return
 
             # 主消息接收循环
             while not self.stop_event.is_set():
                 # 附带超时以确保循环能检查 stop_event
                 try:
                     message = await asyncio.wait_for(websocket.recv(), timeout=2.0)
-                    log.debug(f"[WsServer] 收到客户端消息 (长度: {len(message)})")
                     static["event_handler"].trigger_event(
                         Event("ExternalIO_IN", message=message, client_id=websocket)
                     )
@@ -130,15 +101,100 @@ class AFEDIUMPlugin(AfediumPluginBase):
             log.error(f"[WsServer] 连接处理异常: {e}")
         finally:
             self.connected_clients.remove(websocket)
-            self.verification_codes.pop(websocket, None)
+
+    async def _authenticate_client(self, websocket):
+        auth_type = self.config.conf["auth_type"].lower()
+        if auth_type == "none":
+            return True
+
+        timeout = self.config.conf["auth_timeout"]
+        captcha_popup = None
+        if auth_type == "captcha":
+            expected_answer = ''.join(
+                secrets.choice('0123456789') for _ in range(self.config.conf["captcha_length"])
+            )
+            message = "请输入验证码"
+            log.info(f"新客户端连接，验证码：{expected_answer}")
+            captcha_popup = self._show_captcha_popup(websocket, expected_answer, timeout)
+        elif auth_type == "password":
+            expected_answer = self.config.conf["password"]
+            message = "请输入密码"
+        else:
+            await websocket.send(self._auth_frame("error", "服务端认证类型配置错误"))
+            return False
+
+        try:
+            await websocket.send(self._auth_frame("challenge", message, auth_type=auth_type, timeout=timeout))
+            try:
+                client_response = await asyncio.wait_for(websocket.recv(), timeout=timeout)
+            except asyncio.TimeoutError:
+                await websocket.send(self._auth_frame("error", "认证超时"))
+                log.warning(f"客户端 {websocket.remote_address} 认证超时")
+                return False
+
+            if self._read_auth_answer(client_response) == expected_answer:
+                await websocket.send(self._auth_frame("ok", "认证成功"))
+                log.debug(f"客户端 {websocket.remote_address} 认证成功")
+                return True
+
+            await websocket.send(self._auth_frame("error", "认证失败"))
+            log.warning(f"客户端 {websocket.remote_address} 认证失败")
+            return False
+        finally:
+            self._close_captcha_popup(captcha_popup)
+
+    def _auth_frame(self, stage, message, **extra):
+        payload = {
+            "stage": stage,
+            "message": message,
+            **extra,
+        }
+        return chr(AUTH_CONTROL_CODE) + json.dumps(payload, ensure_ascii=False)
+
+    def _read_auth_answer(self, client_response):
+        if not isinstance(client_response, str) or not client_response:
+            return None
+        if client_response[0] != chr(AUTH_CONTROL_CODE):
+            return None
+        try:
+            payload = json.loads(client_response[1:] or "{}")
+        except json.JSONDecodeError:
+            return None
+        return payload.get("answer")
+
+    def _show_captcha_popup(self, websocket, expected_answer, timeout):
+        popup = SystemPopup(title="AFEDIUM 验证码")
+        popup.add_label(f"客户端: {websocket.remote_address}")
+        popup.add_label(f"验证码: {expected_answer}")
+        popup.add_label(f"请在 {timeout} 秒内完成输入。")
+
+        def on_confirm(_form_data):
+            log.info(f"[{self.id}] 验证码弹窗已手动确认关闭")
+            popup.close()
+
+        popup.add_button("确认", on_confirm)
+        popup_id = popup.show()
+        if popup_id:
+            log.info(f"[{self.id}] 已显示验证码弹窗: {popup_id}")
+            return popup
+
+        log.warning(f"[{self.id}] 显示驱动不可用，无法展示验证码弹窗")
+        return None
+
+    def _close_captcha_popup(self, popup):
+        if not popup:
+            return
+        try:
+            popup.close()
+            log.debug(f"[{self.id}] 验证码弹窗已关闭")
+        except Exception as exc:
+            log.warning(f"[{self.id}] 关闭验证码弹窗失败: {exc}")
 
     def handle_external_output(self, event: Event):
         response_data = event.data.get("response_data")
         client_websocket = event.data.get("client_id")
 
         if client_websocket and response_data is not None and self.loop and self.loop.is_running():
-            log.debug(f"[WsServer] 发送响应给 {client_websocket.remote_address}")
-            log.debug(f"[WsServer] {response_data}")
             asyncio.run_coroutine_threadsafe(
                 client_websocket.send(response_data), self.loop
             )
@@ -169,7 +225,6 @@ class AFEDIUMPlugin(AfediumPluginBase):
                     "ip": local_ip,
                     "port": self.config.conf["server_port"],
                     "UUID": self.config.conf["server_uuid"],
-                    "feature": static.get("features", {}),
                     "using_auth": using_auth,
                     "auth_timeout": self.config.conf["auth_timeout"],
                     "timestamp": datetime.now().isoformat(),

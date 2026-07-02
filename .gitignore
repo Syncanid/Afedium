@@ -3,3 +3,11 @@ __pycache__/
 .venv/
 macos/
 *.pyc
+*.pyo
+*.log
+*.pyz
+config/
+logs/
+pyzoutput/
+plugin_data/
+.afedium_probe/

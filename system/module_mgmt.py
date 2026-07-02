@@ -50,7 +50,13 @@ class AFEDIUMPlugin(AfediumPluginBase):
 
         if "features" not in static:
             static["features"] = {}
-        static["features"].update({"module_mgmt": True})
+        static["features"].update({
+            "module_mgmt": {
+                "title": "模块管理",
+                "standard": "core",
+                "protocol_codes": ["0x03", "0x04"],
+            }
+        })
 
         # 启动后台 Git 源检查
         threading.Thread(target=self.setup_core_git_source, daemon=True).start()
@@ -231,7 +237,7 @@ class AFEDIUMPlugin(AfediumPluginBase):
 
         return self.install_modules(ctx, modules)
 
-    def update_modules(self, ctx):
+    def update_modules(self, ctx, args):
         if not static.get("online"): return "离线模式无法更新仓库"
         try:
             raw = self.get_json_from_url(self.config.conf["modules_endpoint"])

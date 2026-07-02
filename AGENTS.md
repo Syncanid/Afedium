@@ -43,7 +43,7 @@ Frequently useful:
 
 ## WebSocket protocol
 
-Server on port `11840` (TCP, WebSocket) and `12840` (UDP broadcast for service discovery). Control codes `0x01`–`0x1B` are handled by `external_handler.py`. Full protocol docs in `Afedium_ws.md`.
+Server on port `11840` (TCP, WebSocket) and `12840` (UDP broadcast for service discovery). Core control codes `0x01`–`0x04`, file control codes `0x10`–`0x1F`, shared Feature RPC `0x30`, and auth `0xFF` are handled by `external_handler.py` / `ws_server.py`. Full protocol docs in `Afedium_ws.md`.
 
 ## Config quirks
 

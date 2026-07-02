@@ -254,13 +254,13 @@ class AFEDIUMPlugin(AfediumPluginBase):
             zip_file_path = target_base_path + '.zip'
 
             try:
-                ctx.reply(f"正在打包 '{mod_name}' 到 {self.output_dir}/ ...")
+                ctx.reply(f"正在打包 '{mod_name}' 到 {self.output_dir}/ ...\n")
                 if os.path.exists(pyz_file_path): os.remove(pyz_file_path)
 
                 shutil.make_archive(target_base_path, 'zip', mod_source_path)
                 os.rename(zip_file_path, pyz_file_path)
 
-                ctx.reply(f"成功生成: {self.output_dir}/{mod_name}.pyz")
+                ctx.reply(f"成功生成: {self.output_dir}/{mod_name}.pyz\n")
                 success_count += 1
             except Exception as e:
                 ctx.reply(f"打包 '{mod_name}' 失败: {e}")

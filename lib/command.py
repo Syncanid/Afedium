@@ -72,6 +72,7 @@ class CommandNode:
                 if 'output_pipe' in sig.parameters:
                     re_out = self.handler(args=args, output_pipe=ctx)
                 else:
+                    print(args)
                     re_out = self.handler(ctx, args)
 
                 if re_out is not None:
