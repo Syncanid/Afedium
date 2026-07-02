@@ -7,7 +7,7 @@ import urllib
 from urllib.parse import urlparse
 
 import requests
-from lib.common import static, dynamic, comm_lib
+from lib.common import static, dynamic, comm_lib, loaded_plugins
 from lib.logger import log
 from lib.plugin import AfediumPluginBase
 from lib.support_lib import is_valid_url, load_pyz_module
@@ -72,6 +72,14 @@ class AFEDIUMPlugin(AfediumPluginBase):
         comm_lib.unregister("module")
         log.info(f"[{self.id}] 模块管理器已注销核心指令，优雅关闭。")
 
+    def _available_module_ids(self):
+        module_ids = set(static.get("modules", {}).keys())
+        module_ids.update(loaded_plugins.keys())
+        return module_ids
+
+    def _is_module_available(self, module_id):
+        return module_id in self._available_module_ids()
+
     def setup_core_git_source(self):
         # 等待 core 完全启动
         while not static.get("running", {}).get("core", False):
@@ -130,7 +138,7 @@ class AFEDIUMPlugin(AfediumPluginBase):
 
             if self.module_data[module].get("dependencies"):
                 for dependent in self.module_data[module]["dependencies"]:
-                    if dependent in list(static.get("modules", {}).keys()) + self.config.conf["waiting"]:
+                    if self._is_module_available(dependent) or dependent in self.config.conf["waiting"]:
                         ctx.reply(f"依赖已满足或已入队: {dependent}")
                     else:
                         ctx.reply(f"检测到新依赖: {dependent}，将加入安装队列首位")
@@ -153,7 +161,7 @@ class AFEDIUMPlugin(AfediumPluginBase):
                 # 二次依赖校验：防止它的前置依赖在上一步安装失败导致连环崩溃
                 deps_met = True
                 for dep in module.get("dependencies", []):
-                    if dep not in static.get("modules", {}):
+                    if not self._is_module_available(dep):
                         ctx.reply(f"中止安装 {module_n}: 缺少前置依赖 {dep} (可能该依赖未能成功加载)。")
                         deps_met = False
                         break
