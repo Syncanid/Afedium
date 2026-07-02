@@ -1,11 +1,11 @@
 import importlib.util
 import json
 import os
-import shutil
 import sys
 import threading
 import time
 import traceback
+import zipfile
 
 from lib.common import static, loaded_plugins, threads, plugin_lock, comm_lib
 from lib.config import Config
@@ -19,6 +19,10 @@ Info = {
     "pip_dependencies": [],
     "linux_dependencies": []
 }
+
+PACK_EXCLUDED_DIRS = {"__pycache__", ".git", ".hg", ".svn"}
+PACK_EXCLUDED_FILES = {".DS_Store", "Thumbs.db"}
+PACK_EXCLUDED_SUFFIXES = (".pyc", ".pyo")
 
 
 class AFEDIUMPlugin(AfediumPluginBase):
@@ -251,19 +255,36 @@ class AFEDIUMPlugin(AfediumPluginBase):
 
             target_base_path = os.path.join(self.output_dir, mod_name)
             pyz_file_path = target_base_path + '.pyz'
-            zip_file_path = target_base_path + '.zip'
+            tmp_pyz_file_path = pyz_file_path + '.tmp'
 
             try:
                 ctx.reply(f"正在打包 '{mod_name}' 到 {self.output_dir}/ ...\n")
-                if os.path.exists(pyz_file_path): os.remove(pyz_file_path)
+                if os.path.exists(tmp_pyz_file_path): os.remove(tmp_pyz_file_path)
 
-                shutil.make_archive(target_base_path, 'zip', mod_source_path)
-                os.rename(zip_file_path, pyz_file_path)
+                self._pack_source_dir(mod_source_path, tmp_pyz_file_path)
+                os.replace(tmp_pyz_file_path, pyz_file_path)
 
                 ctx.reply(f"成功生成: {self.output_dir}/{mod_name}.pyz\n")
                 success_count += 1
             except Exception as e:
                 ctx.reply(f"打包 '{mod_name}' 失败: {e}")
-                if os.path.exists(zip_file_path): os.remove(zip_file_path)
+                if os.path.exists(tmp_pyz_file_path): os.remove(tmp_pyz_file_path)
 
         return f"打包完毕，共输出 {success_count} 个模块到 ./{self.output_dir}/。"
+
+    def _pack_source_dir(self, source_path, output_path):
+        with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(source_path):
+                dirs[:] = sorted(d for d in dirs if not self._should_skip_pack_dir(d))
+                for file_name in sorted(files):
+                    if self._should_skip_pack_file(file_name):
+                        continue
+                    file_path = os.path.join(root, file_name)
+                    arcname = os.path.relpath(file_path, source_path).replace(os.sep, "/")
+                    zf.write(file_path, arcname)
+
+    def _should_skip_pack_dir(self, dir_name):
+        return dir_name in PACK_EXCLUDED_DIRS
+
+    def _should_skip_pack_file(self, file_name):
+        return file_name in PACK_EXCLUDED_FILES or file_name.endswith(PACK_EXCLUDED_SUFFIXES)
